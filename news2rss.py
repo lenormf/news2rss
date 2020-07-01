@@ -122,17 +122,23 @@ def _feed_rss(source_meta, articles):
         abort(401, "an error occurred while generating the feed")
 
 
-@get("/<feed_type>/<source_id>")
-def get_feed_sources(feed_type, source_id, newsapi):
+@get("/<feed_type>/<source_id>/<subset>")
+def get_feed_sources(feed_type, source_id, subset, newsapi):
+    newsapi_getters = {
+        "all": newsapi.get_everything,
+        "top": newsapi.get_top_headlines,
+    }
     source_meta = next((source for source in newsapi._sources_cache if source["id"] == source_id),
                        None)
 
     if not source_meta:
         abort(401, "invalid source identifier")
+    elif subset not in newsapi_getters.keys():
+        abort(401, "invalid subset, must be one of: %s" % newsapi_getters.keys())
 
     try:
         # Maximum amount of articles returned in a single page: 100
-        articles = newsapi.get_everything(sources=source_id, page_size=100)
+        articles = newsapi_getters[subset](sources=source_id, page_size=100)
         logging.debug("total amount of articles: %d", articles["totalResults"])
     except (ValueError, TypeError) as e:
         logging.error("invalid request: %s", e)
