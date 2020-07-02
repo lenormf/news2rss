@@ -10,7 +10,7 @@ import logging
 import inspect
 import argparse
 
-from enum import Enum, auto
+import pycountry
 
 import bottle
 from bottle import get, abort
@@ -59,33 +59,10 @@ class NewsAPIPlugin(object):
         return wrapper
 
 
-def _feed_rss(source_meta, articles):
+def _feed_rss(sources_cache, query, query_meta, articles):
     feed = FeedGenerator()
 
-    if "name" not in source_meta:
-        logging.error("no 'name' entry in the source meta")
-        abort(401, "an error occurred while generating the feed")
-    feed.title(source_meta["name"])
-
-    if "url" not in source_meta:
-        logging.error("no 'url' entry in the source meta")
-        abort(401, "an error occurred while generating the feed")
-    feed.link(href=source_meta["url"], rel="self")
-
-    if "description" not in source_meta:
-        logging.error("no 'description' entry in the source meta")
-        abort(401, "an error occurred while generating the feed")
-    feed.description(source_meta["description"])
-
-    if "id" in source_meta:
-        feed.id(source_meta["id"])
-
-    if "category" in source_meta:
-        feed.category(term=source_meta["category"])
-
-    if "language" in source_meta:
-        feed.language(source_meta["language"])
-
+    sources = []
     for article in articles:
         entry = feed.add_entry(order="append")
 
@@ -106,39 +83,180 @@ def _feed_rss(source_meta, articles):
             abort(401, "an error occurred while adding an entry")
         entry.description(article["description"])
 
-        if "author" in article:
+        if "author" in article and article["author"]:
             entry.author(name=article["author"], email="e@ma.il")
 
-        if "url" in article:
+        if "url" in article and article["url"]:
             entry.link(href=article["url"], rel="alternate")
 
         if "publishedAt" in article:
             entry.pubDate(article["publishedAt"])
 
+        if article["source"] not in sources:
+            sources.append(article["source"])
+
+    def set_feed_meta(feed, title, link, description, **optional_fields):
+        feed.title(title)
+        feed.link(href=link, rel="self")
+        feed.description(description)
+
+        if "id" in optional_fields:
+            feed.id(optional_fields["id"])
+
+        if "category" in optional_fields:
+            feed.category(term=optional_fields["category"])
+
+        if "language" in optional_fields:
+            feed.language(optional_fields["language"])
+
+    if not sources:
+        optional_fields = {}
+
+        if "category" in query:
+            optional_fields["category"] = query["category"]
+
+        if "language" in query:
+            optional_fields["language"] = query["language"]
+
+        set_feed_meta(feed,
+                      query_meta["description"], query_meta["url"],
+                      query_meta["description"],
+                      **optional_fields)
+    elif len(sources) == 1:
+        source = sources[0]
+        source_meta = next((s for s in sources_cache
+                            if source["id"] == s["id"]),
+                           None)
+        if source_meta:
+            title, link, description = [None] * 3
+            optional_fields = {}
+
+            if "name" not in source_meta:
+                logging.error("no 'name' entry in the source meta")
+                abort(401, "an error occurred while generating the feed")
+            title = source_meta["name"]
+
+            if "url" not in source_meta:
+                logging.error("no 'url' entry in the source meta")
+                abort(401, "an error occurred while generating the feed")
+            link = source_meta["url"]
+
+            if "description" not in source_meta:
+                logging.error("no 'description' entry in the source meta")
+                abort(401, "an error occurred while generating the feed")
+            description = source_meta["description"]
+
+            if "id" in source_meta:
+                optional_fields["id"] = source_meta["id"]
+
+            if "category" in source_meta:
+                optional_fields["category"] = source_meta["category"]
+
+            if "language" in source_meta:
+                optional_fields["language"] = source_meta["language"]
+
+            set_feed_meta(feed, title, link, description, **optional_fields)
+        else:
+            set_feed_meta(feed,
+                          query_meta["description"], query_meta["url"],
+                          "News articles from %s" % (source["name"] or source["id"]))
+    else:
+        optional_fields = {}
+
+        if "category" in query:
+            optional_fields["category"] = query["category"]
+
+        if "language" in query:
+            optional_fields["language"] = query["language"]
+
+        sources_names = []
+        for source in sources:
+            if source["name"]:
+                sources_names.append(source["name"])
+            elif source["id"]:
+                if source["id"] in sources_cache:
+                    sources_names.append(sources_cache[source["id"]]["name"] or source["id"])
+                else:
+                    sources_names.append(source["id"])
+
+        set_feed_meta(feed,
+                      query_meta["description"], query_meta["url"],
+                      "News articles from %s" % ", ".join(sources_names),
+                      **optional_fields)
+
     try:
         return feed.rss_str()
     except ValueError as e:
-        logging.error("invalid data: %s", e)
+        logging.error("unable to generate feed: %s", e)
         abort(401, "an error occurred while generating the feed")
 
 
-@get("/<feed_type>/<source_id>/<subset>")
-def get_feed_sources(feed_type, source_id, subset, newsapi):
+@get("/<feed_type>/<subset>/<query_path:path>")
+def get_feed_sources(feed_type, subset, query_path, newsapi):
+    feed_types = {
+        "rss": _feed_rss,
+    }
     newsapi_getters = {
         "all": newsapi.get_everything,
         "top": newsapi.get_top_headlines,
     }
-    source_meta = next((source for source in newsapi._sources_cache if source["id"] == source_id),
-                       None)
 
-    if not source_meta:
-        abort(401, "invalid source identifier")
+    logging.debug("feed_type: %r", feed_type)
+    logging.debug("subset: %r", subset)
+    logging.debug("query_path: %r", query_path)
+
+    if feed_type not in feed_types.keys():
+        abort(401, "invalid feed type, must be one of: %s" % feed_types.keys())
     elif subset not in newsapi_getters.keys():
         abort(401, "invalid subset, must be one of: %s" % newsapi_getters.keys())
 
+    # Turn the list into a dictionary (even items are keys, odd items are values)
+    it = iter(query_path.split('/'))
+    query = dict(zip(it, it))
+
+    def get_query_description(query):
+        tokens = []
+
+        if "sources" in query:
+            sources_names = []
+            for s in query["sources"].split(','):
+                if s in newsapi._sources_cache:
+                    sources_names.append(newsapi._sources_cache[s]["name"] or s)
+                else:
+                    sources_names.append(s)
+
+            tokens.append("from %s" % (", ".join(sources_names)))
+        else:
+            if "country" in query:
+                country = pycountry.countries.get(alpha_2=query["country"].upper())
+                if country:
+                    country = country.name
+                else:
+                    country = query["country"]
+
+                tokens.append("from country '%s'" % country)
+
+            if "category" in query:
+                tokens.append("in category '%s'" % query["category"])
+
+        if "q" in query:
+            tokens.append("that match '%s'" % query["q"])
+
+        return "News articles %s" % ", ".join(tokens)
+
+    # Generate human-readable information about the query
+    query_meta = {
+        "url": bottle.request.url,
+        "description": get_query_description(query),
+    }
+
+    # Maximum amount of articles returned in a single page: 100
+    if "page_size" not in query:
+        query["page_size"] = 100
+
     try:
-        # Maximum amount of articles returned in a single page: 100
-        articles = newsapi_getters[subset](sources=source_id, page_size=100)
+        logging.debug("query: %r", query)
+        articles = newsapi_getters[subset](**query)
         logging.debug("total amount of articles: %d", articles["totalResults"])
     except (ValueError, TypeError) as e:
         logging.error("invalid request: %s", e)
@@ -147,12 +265,7 @@ def get_feed_sources(feed_type, source_id, subset, newsapi):
         logging.error("couldn't query the API: %s", e)
         abort(401, "an error occurred while fetching the articles")
 
-    logging.debug("requested feed type: %s", feed_type)
-
-    if feed_type == "rss":
-        return _feed_rss(source_meta, articles["articles"])
-    else:
-        abort(401, "invalid feed type")
+    return feed_types[feed_type](newsapi._sources_cache, query, query_meta, articles["articles"])
 
 
 class CliOptions(argparse.Namespace):
