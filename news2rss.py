@@ -250,6 +250,19 @@ def get_feed_sources(feed_type, subset, query_path, newsapi):
         "description": get_query_description(query),
     }
 
+    # Cast integer values
+    try:
+        if "page_size" in query:
+            query["page_size"] = int(query["page_size"])
+    except ValueError:
+        del query["page_size"]
+
+    try:
+        if "page" in query:
+            query["page"] = int(query["page"])
+    except ValueError:
+        del query["page"]
+
     # Maximum amount of articles returned in a single page: 100
     if "page_size" not in query:
         query["page_size"] = 100
