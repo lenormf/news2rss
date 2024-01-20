@@ -10,6 +10,7 @@ import logging
 import inspect
 import argparse
 
+import trafilatura
 import pycountry
 
 import bottle
@@ -25,9 +26,15 @@ class NewsAPIPlugin(object):
     name = "news_api"
     api = 2
 
-    def __init__(self, keyword="newsapi", api_key=None):
+    def __init__(self, keyword="newsapi", keyword_options="newsapi_options", api_key=None, options=None):
         self.keyword = keyword
+        self.keyword_options = keyword_options
         self.newsapi = NewsApiClient(api_key=api_key)
+        self.newsapi_options = {
+            "full_text": False,
+        }
+        if options:
+            self.newsapi_options.update(options)
 
         try:
             self.newsapi._sources_cache = self.newsapi.get_sources()["sources"]
@@ -47,24 +54,28 @@ class NewsAPIPlugin(object):
     def apply(self, callback, context):
         conf = context.config.get(NewsAPIPlugin.name) or {}
         keyword = conf.get("keyword", self.keyword)
+        keyword_options = conf.get("keyword_options", self.keyword_options)
         newsapi = conf.get("newsapi", self.newsapi)
+        newsapi_options = conf.get("newsapi_options", self.newsapi_options)
 
         if self.keyword not in inspect.signature(callback).parameters:
             return callback
 
         def wrapper(*args, **kwargs):
             kwargs[keyword] = newsapi
+            kwargs[keyword_options] = newsapi_options.copy()
             return callback(*args, **kwargs)
 
         return wrapper
 
 
-def _feed_rss(sources_cache, query, query_meta, articles):
+def _feed_rss(sources_cache, query, query_meta, articles, full_text=False):
     feed = FeedGenerator()
 
     sources = []
     for article in articles:
         entry = feed.add_entry(order="append")
+        url_article = article.get("url")
 
         logging.debug("article: %r", article)
 
@@ -77,6 +88,24 @@ def _feed_rss(sources_cache, query, query_meta, articles):
             logging.error("no 'content' entry in the article")
             abort(401, "an error occurred while adding an entry")
         entry.content(article["content"])
+        if full_text and url_article:
+            result = trafilatura.fetch_url(url_article)
+            if result is not None:
+                contents = trafilatura.extract(
+                    result,
+                    url=url_article,
+                    favor_precision=True,
+                    favor_recall=True,
+                    output_format="xml",
+                    include_formatting=True,
+                    include_images=True,
+                    include_links=True,
+                    include_tables=True,
+                    include_comments=False,
+                )
+                if contents is not None:
+                    logging.debug("extracted full page contents: %s", contents)
+                    entry.content(contents)
 
         if "description" not in article:
             logging.error("no 'description' entry in the article")
@@ -86,8 +115,8 @@ def _feed_rss(sources_cache, query, query_meta, articles):
         if "author" in article and article["author"]:
             entry.author(name=article["author"], email="e@ma.il")
 
-        if "url" in article and article["url"]:
-            entry.link(href=article["url"], rel="alternate")
+        if url_article:
+            entry.link(href=url_article, rel="alternate")
 
         if "publishedAt" in article:
             entry.pubDate(article["publishedAt"])
@@ -192,7 +221,7 @@ def _feed_rss(sources_cache, query, query_meta, articles):
 
 
 @get("/<feed_type>/<subset>/<query_path:path>")
-def get_feed_sources(feed_type, subset, query_path, newsapi):
+def get_feed_sources(feed_type, subset, query_path, newsapi, newsapi_options):
     feed_types = {
         "rss": _feed_rss,
     }
@@ -204,6 +233,7 @@ def get_feed_sources(feed_type, subset, query_path, newsapi):
     logging.debug("feed_type: %r", feed_type)
     logging.debug("subset: %r", subset)
     logging.debug("query_path: %r", query_path)
+    logging.debug("newsapi_options: %r", newsapi_options)
 
     if feed_type not in feed_types.keys():
         abort(401, "invalid feed type, must be one of: %s" % feed_types.keys())
@@ -278,7 +308,10 @@ def get_feed_sources(feed_type, subset, query_path, newsapi):
         logging.error("couldn't query the API: %s", e)
         abort(401, "an error occurred while fetching the articles")
 
-    return feed_types[feed_type](newsapi._sources_cache, query, query_meta, articles["articles"])
+    return feed_types[feed_type](
+        newsapi._sources_cache, query, query_meta, articles["articles"],
+        full_text=newsapi_options.get("full_text", False)
+    )
 
 
 class CliOptions(argparse.Namespace):
@@ -287,6 +320,7 @@ class CliOptions(argparse.Namespace):
 
         parser.add_argument("-d", "--debug", default=False, action="store_true", help="Display debug messages")
         parser.add_argument("-v", "--verbose", default=False, action="store_true", help="Display more messages")
+        parser.add_argument("-f", "--full-text", default=False, action="store_true", help="Inline full-length articles in the feed")
         parser.add_argument("-H", "--host", default="localhost", help="Hostname to bind to")
         parser.add_argument("-P", "--port", type=int, default=8080, help="Port to listen on")
         parser.add_argument("-X", "--api-key", help="News API authentication key")
@@ -310,7 +344,14 @@ def main(av):
         logging.critical("No API key set")
         return 1
 
-    bottle.install(NewsAPIPlugin(api_key=api_key))
+    bottle.install(
+        NewsAPIPlugin(
+            api_key=api_key,
+            options={
+                "full_text": cli_options.full_text,
+            }
+        )
+    )
 
     bottle.run(host=cli_options.host, port=cli_options.port,
                debug=cli_options.debug, reloader=cli_options.debug)
